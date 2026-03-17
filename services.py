@@ -11,6 +11,7 @@ import httpx             # Cliente HTTP asíncrono (moderna alternativa a reques
 import os                # Para leer variables de entorno
 import time              # Para calcular la antigüedad del caché
 import feedparser        # Para parsear feeds RSS/Atom
+import yfinance as yf   # Librería que envuelve la API de Yahoo Finance (sin API key)
 
 from dotenv import load_dotenv   # Para cargar variables desde el archivo .env
 
@@ -188,6 +189,83 @@ async def get_real_news() -> list:
         return [{"title": "Error cargando noticias", "source": "Sistema", "url": "#"}]
 
 
+# ─── Servicio de Stocks (Yahoo Finance) ──────────────────────────────────────
+
+# Tickers a seguir: IPSA (índice bursátil chileno) + blue chips locales
+# Yahoo Finance usa sufijo ".SN" para acciones de la Bolsa de Santiago
+STOCK_TICKERS = os.getenv(
+    "STOCK_TICKERS",
+    "^IPSA,FALABELLA.SN,COPEC.SN,BSANTANDER.SN"
+).split(",")
+
+
+def _fetch_stocks_sync() -> list:
+    """
+    Función SINCRÓNICA que usa yfinance para obtener cotizaciones.
+
+    yfinance es síncrono por diseño (usa requests internamente),
+    por eso la llamamos desde asyncio.to_thread para no bloquear el servidor.
+    """
+    results = []
+
+    for ticker_symbol in STOCK_TICKERS:
+        try:
+            # yf.Ticker crea un objeto con toda la info de ese símbolo
+            ticker = yf.Ticker(ticker_symbol.strip())
+
+            # fast_info es más rápido que .info — solo trae los campos esenciales
+            info = ticker.fast_info
+
+            # Precio actual y precio de cierre anterior para calcular el cambio
+            current_price = info.last_price
+            prev_close    = info.previous_close
+
+            # Si no hay datos (mercado cerrado, símbolo incorrecto), saltamos
+            if current_price is None or prev_close is None:
+                print(f"[stocks] Sin datos para {ticker_symbol}, omitiendo.")
+                continue
+
+            # Calculamos el cambio porcentual respecto al cierre anterior
+            # Fórmula: ((precio_actual - cierre_anterior) / cierre_anterior) * 100
+            change_pct = round((current_price - prev_close) / prev_close * 100, 2)
+
+            results.append({
+                "symbol": ticker_symbol.strip(),
+                "price":  round(float(current_price), 2),
+                "change": change_pct    # Positivo = sube, Negativo = baja
+            })
+            print(f"[stocks] {ticker_symbol}: ${current_price:.2f} ({change_pct:+.2f}%)")
+
+        except Exception as e:
+            print(f"[stocks] Error obteniendo {ticker_symbol}: {e}")
+
+    return results
+
+
+async def get_real_stocks() -> list:
+    """
+    Versión asíncrona del fetcher de stocks.
+
+    asyncio.to_thread ejecuta la función síncrona _fetch_stocks_sync en un
+    thread separado del pool de threads de Python, evitando bloquear el
+    event loop de asyncio (que maneja todas las peticiones del servidor).
+    """
+    cached = _cache_get("stocks")
+    if cached:
+        print(f"[caché] Stocks servidos desde caché ({len(cached)} tickers).")
+        return cached
+
+    print(f"[stocks] Descargando cotizaciones de: {STOCK_TICKERS}")
+
+    # asyncio.to_thread → convierte una función síncrona en una corrutina awaitable
+    stocks = await asyncio.to_thread(_fetch_stocks_sync)
+
+    if stocks:  # Solo cacheamos si obtuvimos datos reales
+        _cache_set("stocks", stocks)
+
+    return stocks
+
+
 # ─── Función Agregadora Principal ─────────────────────────────────────────────
 
 async def fetch_unified_data() -> dict:
@@ -195,26 +273,30 @@ async def fetch_unified_data() -> dict:
     Lanza TODAS las peticiones en PARALELO usando asyncio.gather.
 
     Sin asyncio.gather, haríamos:
-        clima   → esperar → noticias → esperar   (secuencial, lento)
+        clima    → esperar → noticias → esperar → stocks → esperar  (secuencial)
     Con asyncio.gather:
-        clima   ─────────┐
-        noticias  ───────┴→ resultado combinado  (paralelo, rápido)
+        clima    ──────────┐
+        noticias ──────────┤→ resultado combinado  (paralelo, mucho más rápido)
+        stocks   ──────────┘
 
     Retorna un dict con weather, news y stocks listos para el endpoint.
     """
-    print("[aggregator] Iniciando fetch paralelo de datos...")
+    print("[aggregator] Iniciando fetch paralelo de datos (clima + noticias + stocks)...")
 
-    # asyncio.gather recibe corrutinas y las ejecuta concurrentemente
-    weather, news = await asyncio.gather(
+    # Las tres corrutinas se ejecutan concurrentemente, no una tras otra
+    weather, news, stocks = await asyncio.gather(
         get_weather(),
-        get_real_news()
+        get_real_news(),
+        get_real_stocks()   # ← ¡Ahora los stocks son reales!
     )
 
-    print(f"[aggregator] Completado: clima={weather['city']}, noticias={len(news)}")
+    print(
+        f"[aggregator] Completado: "
+        f"clima={weather['city']}, noticias={len(news)}, stocks={len(stocks)}"
+    )
 
     return {
         "weather": weather,
         "news":    news,
-        # Stocks hardcodeados por ahora — próximo paso: integrar API financiera
-        "stocks": [{"symbol": "IPSA", "price": 6500.2, "change": 0.5}]
+        "stocks":  stocks
     }

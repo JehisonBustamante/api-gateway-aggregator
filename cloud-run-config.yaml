@@ -1,0 +1,207 @@
+"""
+cloud-run-config.yaml
+
+Configuración recomendada para desplegar en Google Cloud Run.
+Este archivo documenta las mejores prácticas y configuración óptima.
+
+Uso con gcloud:
+  gcloud run deploy api-gateway-aggregator \
+    --image gcr.io/TU_PROYECTO/api-gateway-aggregator:latest \
+    --platform managed \
+    --region us-central1 \
+    --memory 512Mi \
+    --cpu 1 \
+    --timeout 60s \
+    --port 8080
+"""
+
+# ════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN DE CLOUD RUN
+# ════════════════════════════════════════════════════════════════════════════
+
+# MEMORIA Y CPU
+# ─────────────────────────────────────────────────────────────────────────
+# Memory: 128MB, 256MB, 512MB, 1GB, 2GB, 4GB, 6GB, 8GB
+# CPU: 1, 2, 4 (solo en nivel premium)
+#
+# Para una API pequeña como esta:
+#   - 512Mi + 1 CPU = Excelente relación costo/rendimiento
+#   - Si tienes picos: aumenta a 1GB
+#   - Si tienes caché/memoria: considerа 2GB
+#
+# RECOMENDACIÓN ACTUAL: 512Mi + 1 CPU
+Memory: 512Mi
+CPU: 1
+
+
+# CONCURRENCIA
+# ─────────────────────────────────────────────────────────────────────────
+# Cuántas peticiones simultáneas puede manejar una instancia
+#
+# Con FastAPI + async:
+#   - Sin conexiones BD: 1000 simultáneas sin problemas
+#   - Con HTTP calls (clima, noticias): 500-1000 típico
+#   - Mejor empezar conservador y aumentar según métricas
+#
+# RECOMENDACIÓN: 100-200 (Cloud Run escalará automáticamente)
+MaxConcurrentRequests: 100
+
+
+# TIMEOUT
+# ─────────────────────────────────────────────────────────────────────────
+# Tiempo máximo para una petición antes de terminarla
+#
+# API de agregación de datos:
+#   - Típicamente 2-5 segundos
+#   - Si excede: aumenta a 30-60
+#
+# RECOMENDACIÓN: 60 segundos (suficiente para esperas de red)
+Timeout: 60s
+
+
+# COLD START OPTIMIZATION
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Min Instances:
+#   - 0: Solo paga cuando hay peticiones (CHEAPER)
+#   - 1-2: Siempre hay una caliente (MÁS RÁPIDO pero CARO)
+#   - Para APIs públicas 24/7 pequeñas: 0 está bien
+#
+# Max Instances:
+#   - Por defecto: 100
+#   - Si esperas muchas peticiones: aumenta
+#   - Ajusta según presupuesto
+#
+# RECOMENDACIÓN: Min=0, Max=100
+MinInstances: 0
+MaxInstances: 100
+
+
+# PUERTO
+# ─────────────────────────────────────────────────────────────────────────
+# Cloud Run inyecta la variable PORT automáticamente
+# La app DEBE escuchar en 0.0.0.0:${PORT}
+#
+# En nuestro caso:
+#   - Dockerfile: CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
+#   - main.py: port = int(os.environ.get("PORT", 8080))
+#
+# RECOMENDACIÓN: 8080 (estándar Google)
+Port: 8080
+
+
+# LOGS Y MONITOREO
+# ─────────────────────────────────────────────────────────────────────────
+# Cloud Run automáticamente envía logs a Google Cloud Logging
+# Asegúrate de que:
+#   - PYTHONUNBUFFERED=1 (sí, en Dockerfile)
+#   - Los logs se escriben a stdout/stderr (sí, uvicorn lo hace)
+#
+# Ver logs:
+#   gcloud run logs read api-gateway-aggregator --limit 50
+#   gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=api-gateway-aggregator" --limit 50 --format json
+#
+# RECOMENDACIÓN: Configurar alertas en Cloud Monitoring
+Logging:
+  Format: JSON (recomendado para análisis)
+  Sink: Google Cloud Logging
+
+
+# HEALTH CHECKS
+# ─────────────────────────────────────────────────────────────────────────
+# Cloud Run verifica que tu app responda en el puerto
+#
+# Endpoint de health check:
+#   GET /health → {"status": "ok"}
+#
+# Cloud Run automáticamente lo usa (no necesitas configurar)
+#
+# RECOMENDACIÓN: Ya está implementado ✓
+HealthCheck:
+  Endpoint: /health
+  Method: GET
+  Expected: {"status": "ok"}
+
+
+# CONFIGURACIÓN DE SEGURIDAD
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Autenticación:
+#   - --allow-unauthenticated: Para APIs públicas (actual)
+#   - Sin flag: Solo usuarios autenticados
+#
+# CORS:
+#   - allow_origins=["*"]: Para desarrollo/pruebas
+#   - allow_origins=["https://mi-dominio.com"]: Para producción
+#
+# HTTPS:
+#   - Cloud Run automáticamente proporciona SSL/TLS ✓
+#
+# RECOMENDACIÓN: Para producción, restringir orígenes CORS
+Security:
+  HTTPS: Automático (por Cloud Run)
+  CORS: ["*"] en desarrollo, restringir en producción
+  Auth: allow-unauthenticated
+
+
+# GESTIÓN DE SECRETOS
+# ─────────────────────────────────────────────────────────────────────────
+# Si necesitas API keys:
+#   1. Guardar en Google Secret Manager
+#   2. Montarlos como volúmenes o variables de entorno
+#   3. NUNCA comitear .env a Git
+#
+# Ejemplo:
+#   gcloud run deploy api-gateway-aggregator \
+#     --set-env-vars WEATHER_API_KEY=$(gcloud secrets versions access latest --secret=weather-api-key)
+#
+# RECOMENDACIÓN: Implementar cuando tengas credenciales sensibles
+SecretsManagement:
+  Provider: Google Secret Manager
+  MountMode: Environment variables
+
+
+# COSTOS ESTIMADOS
+# ─────────────────────────────────────────────────────────────────────────
+# Tier gratuito (mensual):
+#   - 2 millones de peticiones
+#   - 400k GB-segundos de compute
+#   - 1 GB de datos de salida
+#
+# Precio después del tier gratuito (aproximado):
+#   - Invocación: $0.40 por millón
+#   - Compute: $0.0000041 por GB-segundo (512Mi = ~0.25 GB)
+#   - 1000 peticiones × 2s cada una ≈ $0.0004
+#
+# ESTIMACIÓN: $5-20/mes con tráfico moderado
+Costs:
+  FreeMonth: 2M requests
+  AproxMonthlyCost: "$5-20"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PROCESO DE DESPLIEGUE RECOMENDADO
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 1. Asegúrate de que:
+#    ✓ main.py tiene health check (/health)
+#    ✓ Dockerfile usa python:3.11-slim
+#    ✓ .dockerignore existe para excluir archivos innecesarios
+#    ✓ .gcloudignore existe para optimizar envío
+#
+# 2. Construir localmente:
+#    docker build -t api-gateway-aggregator .
+#    docker run -p 8080:8080 api-gateway-aggregator
+#
+# 3. Desplegar a Cloud Run:
+#    bash deploy.sh api-gateway-aggregator us-central1 mi-proyecto-gcp
+#
+# 4. Validar despliegue:
+#    curl https://api-gateway-aggregator-xyz.run.app/health
+#    curl https://api-gateway-aggregator-xyz.run.app/docs
+#
+# 5. Monitorear:
+#    gcloud run logs read api-gateway-aggregator --limit 100 --follow
+#
+# ════════════════════════════════════════════════════════════════════════════
+

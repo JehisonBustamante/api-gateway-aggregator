@@ -7,7 +7,10 @@ FastAPI usa Python's async/await nativamente, lo que permite manejar
 miles de peticiones concurrentes sin bloquear el hilo principal.
 """
 
+import os
 from fastapi import FastAPI, Query   # FastAPI y Query para parámetros con validación
+from fastapi.responses import RedirectResponse  # Para redirigir a /docs
+from fastapi.middleware.cors import CORSMiddleware  # Para permitir CORS
 from schemas import UnifiedFeed      # El schema Pydantic que define la forma de la respuesta
 from services import fetch_unified_data  # La función que agrega todos los datos
 
@@ -20,6 +23,38 @@ app = FastAPI(
     description="Middleware que agrega clima, noticias y stocks en una sola llamada.",
     version="1.0.0"
 )
+
+
+# ─── Configuración de CORS ────────────────────────────────────────────────────
+# Permite que frontends desde cualquier origen hagan peticiones a esta API.
+# ⚠️ En producción, considera restringir los orígenes permitidos si es posible.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],                    # Permite todos los orígenes
+    allow_credentials=True,
+    allow_methods=["*"],                    # Permite todos los métodos HTTP
+    allow_headers=["*"]                     # Permite todos los headers
+)
+
+
+# ─── Redirección de raíz a Swagger ────────────────────────────────────────────
+@app.get("/")
+async def root():
+    """
+    Redirecciona automáticamente a /docs (Swagger UI).
+    Proporciona una mejor experiencia al acceder a la raíz del servidor.
+    """
+    return RedirectResponse(url="/docs")
+
+
+# ─── Health Check para Cloud Run ──────────────────────────────────────────────
+@app.get("/health")
+async def health_check():
+    """
+    Endpoint de verificación de salud para Google Cloud Run.
+    Devuelve un status 200 si la aplicación está funcionando correctamente.
+    """
+    return {"status": "ok"}
 
 
 # ─── Endpoint Principal: /v1/feed ─────────────────────────────────────────────
@@ -62,4 +97,8 @@ async def get_feed(
 # No se ejecuta cuando uvicorn importa el módulo (que es lo normal en producción).
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Puerto dinámico: lee from variable de entorno PORT, con fallback a 8080
+    # Cloud Run automáticamente inyecta esta variable
+    port = int(os.environ.get("PORT", 8080))
+    # host="0.0.0.0" permite que Cloud Run reciba peticiones desde cualquier interfaz
+    uvicorn.run(app, host="0.0.0.0", port=port)

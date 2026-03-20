@@ -38,13 +38,17 @@ _cache: dict = {}
 CACHE_TTL = 600  # Tiempo de vida del caché: 600 segundos = 10 minutos
 
 
-def _cache_get(key: str):
-    """Lee del caché. Devuelve los datos si aún son válidos, o None si caducaron."""
+def _cache_get(key: str, allow_stale: bool = False):
+    """
+    Lee del caché. 
+    - Si allow_stale=False (default): Devuelve datos solo si no han caducado.
+    - Si allow_stale=True: Devuelve los datos aunque hayan caducado (fallback).
+    """
     if key in _cache:
         data, ts = _cache[key]
-        if time.time() - ts < CACHE_TTL:  # ¿Han pasado menos de 10 minutos?
+        if allow_stale or (time.time() - ts < CACHE_TTL):
             return data
-    return None  # Caché vacío o expirado
+    return None
 
 
 def _cache_set(key: str, data):
@@ -65,6 +69,7 @@ async def get_weather() -> dict:
     El resultado se guarda en caché por CACHE_TTL segundos.
     """
     # ¿Tenemos un resultado fresco en caché? Si sí, lo devolvemos directamente.
+    # ¿Tenemos un resultado fresco en caché?
     cached = _cache_get("weather")
     if cached:
         print("[caché] Clima servido desde caché.")
@@ -104,9 +109,10 @@ async def get_weather() -> dict:
             async with httpx.AsyncClient(timeout=10) as client:
                 response = await client.get(url)
                 response.raise_for_status()
-                json_data = response.json()
+                # La respuesta de wttr.in puede fallar o cambiar formato
+                if "data" not in json_data or "current_condition" not in json_data["data"]:
+                    raise KeyError("Formato inesperado en wttr.in (falta 'data' o 'current_condition')")
 
-                # La respuesta de wttr.in tiene la estructura: json["data"]["current_condition"][0]
                 current = json_data["data"]["current_condition"][0]
                 result = {
                     "city":        CITY_NAME,
@@ -116,7 +122,13 @@ async def get_weather() -> dict:
                 print(f"[wttr.in] Clima obtenido: {result['temperature']}°C, {result['condition']}")
 
         except Exception as e:
-            print(f"[wttr.in] Error: {e}. Devolviendo valores por defecto.")
+            print(f"[wttr.in] Error: {e}. Intentando usar caché expirado...")
+            # Si wttr.in falla, intentamos devolver el último clima conocido (aunque sea viejo)
+            stale = _cache_get("weather", allow_stale=True)
+            if stale:
+                print("[caché] Usando clima expirado como fallback de emergencia.")
+                return stale
+            
             result = {"city": CITY_NAME, "temperature": 0.0, "condition": "Clima no disponible"}
 
     # Guardar en caché para no volver a llamar a la API en los próximos 10 min
@@ -129,46 +141,34 @@ async def get_weather() -> dict:
 async def get_real_news() -> list:
     """
     Descarga y parsea noticias de Chile desde un feed RSS.
-
-    Fuente por defecto: Google News Chile (sin API key requerida).
-    Configurable via NEWS_RSS_URL en .env.
-
-    El resultado se guarda en caché por CACHE_TTL segundos.
-    Retorna una lista de dicts con keys: title, source, url.
+    Implementa Stale-While-Revalidate: si la API falla, usa el caché expirado.
     """
-    # ¿Tenemos noticias frescas en caché?
+    # 1. ¿Tenemos noticias frescas ( < 10 min)?
     cached = _cache_get("news")
     if cached:
-        print(f"[caché] Noticias servidas desde caché ({len(cached)} ítems).")
+        print(f"[caché] Noticias frescas servidas ({len(cached)} ítems).")
         return cached
 
     try:
-        # Descargamos el XML del RSS de forma asíncrona con httpx.
-        # Google News requiere un User-Agent real para no bloquear el request.
+        # Intentamos descargar (con 2 retries y timeout de 20s)
         print(f"[RSS] Descargando noticias desde: {NEWS_RSS_URL}")
-        async with httpx.AsyncClient(timeout=15) as client:
+        
+        async with httpx.AsyncClient(timeout=20) as client:
             response = await client.get(
                 NEWS_RSS_URL,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; Aggregator/1.0)"},
                 follow_redirects=True
             )
             response.raise_for_status()
-            raw_xml = response.text   # El RSS viene en formato XML como texto
+            raw_xml = response.text
 
-        # feedparser convierte el XML en un objeto Python navegable
+        # Parseo del feed
         feed = feedparser.parse(raw_xml)
-        print(f"[RSS] Feed parseado: {len(feed.entries)} entradas encontradas.")
-
         news_items = []
-        # Limitamos a 20 artículos para tener margen de sobra para la paginación
         for entry in feed.entries[:20]:
-            # Google News formatea el título como "Titular del artículo - NombreDiario"
-            # Separamos para obtener la fuente al final del string
             title  = entry.get("title", "Sin título")
             source = "Google News"
-
             if " - " in title:
-                # rsplit con maxsplit=1 divide solo por el ÚLTIMO " - "
                 parts = title.rsplit(" - ", 1)
                 title, source = parts[0].strip(), parts[1].strip()
 
@@ -178,15 +178,26 @@ async def get_real_news() -> list:
                 "url":    entry.get("link", "#")
             })
 
-        # Guardar en caché
+        if not news_items:
+            raise ValueError("Feed RSS vacío o sin entradas válidas")
+
+        # Guardar en caché y retornar
         _cache_set("news", news_items)
-        print(f"[RSS] {len(news_items)} noticias guardadas en caché.")
+        print(f"[RSS] {len(news_items)} noticias actualizadas en caché.")
         return news_items
 
     except Exception as e:
         print(f"[RSS] Error cargando noticias: {e}")
-        # Devolvemos al menos un ítem para no romper el schema de la API
-        return [{"title": "Error cargando noticias", "source": "Sistema", "url": "#"}]
+        
+        # 2. FALLBACK: Stale-While-Revalidate
+        # Si la API falla, intentamos devolver el caché aunque esté caducado
+        stale_news = _cache_get("news", allow_stale=True)
+        if stale_news:
+            print(f"[caché] API de noticias caída o lenta. Sirviendo {len(stale_news)} noticias expiradas.")
+            return stale_news
+
+        # 3. ÚLTIMO RECURSO: Mensaje amigable
+        return [{"title": "Noticias temporalmente no disponibles (reintente en unos minutos)", "source": "Sistema", "url": "#"}]
 
 
 # ─── Servicio de Stocks (Yahoo Finance) ──────────────────────────────────────

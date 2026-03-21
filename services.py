@@ -109,11 +109,14 @@ async def get_weather() -> dict:
             async with httpx.AsyncClient(timeout=10) as client:
                 response = await client.get(url)
                 response.raise_for_status()
+                
+                json_data = response.json()
+                
                 # La respuesta de wttr.in puede fallar o cambiar formato
-                if "data" not in json_data or "current_condition" not in json_data["data"]:
-                    raise KeyError("Formato inesperado en wttr.in (falta 'data' o 'current_condition')")
+                if "current_condition" not in json_data:
+                    raise KeyError("Formato inesperado en wttr.in (falta 'current_condition')")
 
-                current = json_data["data"]["current_condition"][0]
+                current = json_data["current_condition"][0]
                 result = {
                     "city":        CITY_NAME,
                     "temperature": float(current["temp_C"]),
